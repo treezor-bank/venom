@@ -2,14 +2,12 @@ package http
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -41,6 +39,7 @@ type Executor struct {
 	Body              string      `json:"body" yaml:"body"`
 	BodyFile          string      `json:"bodyfile" yaml:"bodyfile"`
 	MultipartForm     interface{} `json:"multipart_form" yaml:"multipart_form"`
+	KeyValue          interface{} `json:"key_value" yaml:"key_value"`
 	Headers           Headers     `json:"headers" yaml:"headers"`
 	IgnoreVerifySSL   bool        `json:"ignore_verify_ssl" yaml:"ignore_verify_ssl" mapstructure:"ignore_verify_ssl"`
 	BasicAuthUser     string      `json:"basic_auth_user" yaml:"basic_auth_user" mapstructure:"basic_auth_user"`
@@ -48,8 +47,6 @@ type Executor struct {
 	SkipHeaders       bool        `json:"skip_headers" yaml:"skip_headers" mapstructure:"skip_headers"`
 	SkipBody          bool        `json:"skip_body" yaml:"skip_body" mapstructure:"skip_body"`
 	Proxy             string      `json:"proxy" yaml:"proxy" mapstructure:"proxy"`
-	NoFollowRedirect  bool        `json:"no_follow_redirect" yaml:"no_follow_redirect" mapstructure:"no_follow_redirect"`
-	UnixSock          string      `json:"unix_sock" yaml:"unix_sock" mapstructure:"unix_sock"`
 }
 
 // Result represents a step result. Json and yaml descriptor are used for json output
@@ -92,6 +89,7 @@ func (Executor) Run(testCaseContext venom.TestCaseContext, l venom.Logger, step 
 
 	// dirty: mapstructure doesn't like decoding map[interface{}]interface{}, let's force manually
 	e.MultipartForm = step["multipart_form"]
+	e.KeyValue = step["key_value"]
 
 	r := Result{Executor: e}
 
@@ -107,16 +105,6 @@ func (Executor) Run(testCaseContext venom.TestCaseContext, l venom.Logger, step 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: e.IgnoreVerifySSL},
 	}
-
-	if len(e.UnixSock) > 0 {
-		tr.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
-			return net.DialUnix("unix", nil, &net.UnixAddr{
-				Name: e.UnixSock,
-				Net:  "unix",
-			})
-		}
-	}
-
 	if len(e.Proxy) > 0 {
 		proxyURL, err := url.Parse(e.Proxy)
 		if err != nil {
@@ -125,11 +113,6 @@ func (Executor) Run(testCaseContext venom.TestCaseContext, l venom.Logger, step 
 		tr.Proxy = http.ProxyURL(proxyURL)
 	}
 	client := &http.Client{Transport: tr}
-	if e.NoFollowRedirect {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
 
 	start := time.Now()
 	l.Debugf("http.Run.doRequest> Begin")
@@ -190,8 +173,65 @@ func (e Executor) getRequest(workdir string) (*http.Request, error) {
 	}
 	body := &bytes.Buffer{}
 	var writer *multipart.Writer
-	if e.Body != "" {
+
+	if e.Body != "" && e.KeyValue != nil {
+		keyValueRequest := map[string]string{}
+		keyvalue, ok := e.KeyValue.(map[interface{}]interface{})
+		if !ok {
+			return nil, fmt.Errorf("'key_value' should be a map")
+		}
+		for k, v := range keyvalue {
+
+			key, ok := k.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with keys as strings")
+			}
+			value, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with values as strings")
+			}
+			keyValueRequest[key] = value
+		}
+
+		s := string(e.Body)
+		for k, v := range keyValueRequest {
+			s = strings.Replace(s, k, v, -1)
+		}
+		body = bytes.NewBuffer([]byte(s))
+
+	} else if e.Body != "" {
 		body = bytes.NewBuffer([]byte(e.Body))
+	} else if e.BodyFile != "" && e.KeyValue != nil {
+		keyValueRequest := map[string]string{}
+		keyvalue, ok := e.KeyValue.(map[interface{}]interface{})
+		if !ok {
+			return nil, fmt.Errorf("'key_value' should be a map")
+		}
+		for k, v := range keyvalue {
+
+			key, ok := k.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with keys as strings")
+			}
+			value, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with values as strings")
+			}
+			keyValueRequest[key] = value
+		}
+		path := filepath.Join(workdir, string(e.BodyFile))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+
+			temp, err := ioutil.ReadFile(path)
+			if err != nil {
+				return nil, err
+			}
+			s := string(temp)
+			for k, v := range keyValueRequest {
+				s = strings.Replace(s, k, v, -1)
+			}
+			body = bytes.NewBuffer([]byte(s))
+		}
 	} else if e.BodyFile != "" {
 		path := filepath.Join(workdir, string(e.BodyFile))
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -200,6 +240,78 @@ func (e Executor) getRequest(workdir string) (*http.Request, error) {
 				return nil, err
 			}
 			body = bytes.NewBuffer(temp)
+		}
+	} else if e.MultipartForm != nil && e.KeyValue != nil {
+		keyValueRequest := map[string]string{}
+
+		keyvalue, ok := e.KeyValue.(map[interface{}]interface{})
+		if !ok {
+			return nil, fmt.Errorf("'key_value' should be a map")
+		}
+		writer = multipart.NewWriter(body)
+		for k, v := range keyvalue {
+
+			key, ok := k.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with keys as strings")
+			}
+			value, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("'key_value' should be a map with values as strings")
+			}
+			keyValueRequest[key] = value
+		}
+
+		form, ok := e.MultipartForm.(map[interface{}]interface{})
+		if !ok {
+			return nil, fmt.Errorf("'multipart_form' should be a map")
+		}
+		writer = multipart.NewWriter(body)
+		for k, v := range form {
+			key, ok := k.(string)
+			if !ok {
+				return nil, fmt.Errorf("'multipart_form' should be a map with keys as strings")
+			}
+			value, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("'multipart_form' should be a map with values as strings")
+			}
+			// Considering file will be prefixed by @ (since you could also post regular data in the body)
+			if strings.HasPrefix(value, "@") {
+
+				xmlFile, err := os.Open(value[1:])
+				// if we os.Open returns an error then handle it
+				if err != nil {
+					fmt.Println(err)
+				}
+				byteValue, _ := ioutil.ReadAll(xmlFile)
+				s := string(byteValue)
+				for k, v := range keyValueRequest {
+					s = strings.Replace(s, k, v, -1)
+				}
+
+				//ioutil.WriteFile(value[1:], []byte(s), 0644)
+				// defer the closing of our xmlFile so that we can parse it later on
+				xmlFile.Close()
+
+				// todo: how can we be sure the @ is not the value we wanted to use ?
+				if _, err := os.Stat(value[1:]); !os.IsNotExist(err) {
+					err := writer.WriteField(key, s)
+					if err != nil {
+						return nil, err
+					}
+					// if err := writeFile(part, value[1:]); err != nil {
+					// 	return nil, err
+					// }
+					continue
+				}
+			}
+			if err := writer.WriteField(key, value); err != nil {
+				return nil, err
+			}
+		}
+		if err := writer.Close(); err != nil {
+			return nil, err
 		}
 	} else if e.MultipartForm != nil {
 		form, ok := e.MultipartForm.(map[interface{}]interface{})
